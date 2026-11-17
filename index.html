@@ -314,10 +314,10 @@ function eliminarAusentes(idsVigentes) {
 async function actualizar() {
     if (cargando) return;
     cargando = true;
-    proximaAct = Date.now() + INTERVALO_MS;
 
     try {
         const datos = await descargarDatos();
+        ultimoFetch = datos.fetchedAt || 0;
 
         if (!datos.fetchedAt) {
             mostrarEstado("Aún no hay datos: en GitHub, pestaña Actions → «Actualizar datos Renfe» → Run workflow.");
@@ -357,10 +357,17 @@ async function actualizar() {
             : `Error: ${err.message}`);
     } finally {
         cargando = false;
+        // La siguiente lectura se sincroniza con la publicación de datos nuevos
+        // (el servidor publica cada ~60 s); si van con retraso, se reintenta cada 10 s.
+        const objetivo = ultimoFetch ? ultimoFetch * 1000 + CICLO_DATOS_MS + MARGEN_MS : 0;
+        proximaAct = objetivo > Date.now() ? objetivo : Date.now() + 10000;
     }
 }
 
-let proximaAct = Date.now() + INTERVALO_MS;
+const CICLO_DATOS_MS = 60000;   // cada cuánto se publican datos nuevos
+const MARGEN_MS = 8000;         // margen de propagación de GitHub
+let ultimoFetch = 0;
+let proximaAct = Date.now() + 10000;
 function pintarCuenta() {
     const r = Math.max(0, Math.ceil((proximaAct - Date.now()) / 1000));
     const m = String(Math.floor(r / 60)).padStart(2, "0");
@@ -370,7 +377,7 @@ function pintarCuenta() {
 setInterval(pintarCuenta, 250);
 
 actualizar();
-setInterval(() => { if (!document.hidden) actualizar(); }, INTERVALO_MS);
+setInterval(() => { if (!document.hidden && !cargando && Date.now() >= proximaAct) actualizar(); }, 1000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) actualizar(); });
 </script>
 
