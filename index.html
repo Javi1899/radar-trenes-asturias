@@ -58,19 +58,18 @@
 
 <script>
 // =====================================================
-// 1. CONFIGURACIÓN (EQUIVALENTE A CONSTANTES EN C#)
+// 1. CONFIGURACIÓN
 // =====================================================
 
-// Tu Cloudflare Worker configurado en https://dash.cloudflare.com
 const WORKER_URL = "https://morning-salad-4534.tuerojuncojavier2.workers.dev";
 
-// Feeds oficiales GTFS-Realtime JSON de Renfe (mismos datos que los .pb, sin fallos binarios)
+// Feeds oficiales GTFS-Realtime JSON de Renfe
 const URL_POSICIONES    = "https://gtfsrt.renfe.com/vehicle_positions.json";
 const URL_RETRASOS      = "https://gtfsrt.renfe.com/trip_updates.json";
 const URL_POSICIONES_LD = "https://gtfsrt.renfe.com/vehicle_positions_LD.json";
 const URL_RETRASOS_LD   = "https://gtfsrt.renfe.com/trip_updates_LD.json";
 
-// Rectángulo geográfico de Asturias (idéntico al filtro de la app C#)
+// Rectángulo geográfico de Asturias
 const LAT_MIN = 42.70;
 const LAT_MAX = 43.85;
 const LON_MIN = -7.30;
@@ -79,11 +78,14 @@ const LON_MAX = -4.30;
 // Refresco automático cada 20 segundos
 const INTERVALO_MS = 20000;
 
+// Tiempo máximo de espera ampliado a 45 segundos (los JSON de Renfe pesan varios MB)
+const TIMEOUT_DESCARGA_MS = 45000;
+
 let actualizando = false;
 const marcadoresTrenes = {};
 
 // =====================================================
-// 2. INICIALIZACIÓN DEL MAPA LEAFLET (COMO EN WEBVIEW2)
+// 2. INICIALIZACIÓN DEL MAPA LEAFLET
 // =====================================================
 
 const map = L.map('map').setView([43.36, -5.85], 9);
@@ -135,21 +137,18 @@ function formatearHoraActual() {
 }
 
 // =====================================================
-// 3. DESCARGA DE DATOS (CON PUENTE CORS Y FALLBACK)
+// 3. DESCARGA DE DATOS (CON TIMEOUT AMPLIO Y REINTENTO)
 // =====================================================
 
 async function descargarJsonRenfe(urlRenfe) {
     const baseWorker = WORKER_URL.replace(/\/+$/, "");
-    const rutas = [
-        `${baseWorker}/?url=${encodeURIComponent(urlRenfe)}`,
-        urlRenfe
-    ];
+    const destino = `${baseWorker}/?url=${encodeURIComponent(urlRenfe)}`;
 
     let ultimoError = "Sin respuesta";
 
-    for (const destino of rutas) {
+    for (let intento = 1; intento <= 2; intento++) {
         const controlador = new AbortController();
-        const timeout = setTimeout(() => controlador.abort(), 15000);
+        const timeout = setTimeout(() => controlador.abort(), TIMEOUT_DESCARGA_MS);
 
         try {
             const resp = await fetch(destino, {
@@ -157,22 +156,30 @@ async function descargarJsonRenfe(urlRenfe) {
                 cache: "no-store"
             });
 
-            const texto = await resp.text();
-
             if (!resp.ok) {
                 throw new Error(`HTTP ${resp.status}`);
             }
 
+            const texto = await resp.text();
             const limpio = texto.trim();
+
+            if (!limpio) {
+                throw new Error("Respuesta vacía de Renfe");
+            }
+
             if (limpio.startsWith("<")) {
                 const matchTitulo = limpio.match(/<title[^>]*>([^<]+)<\/title>/i);
-                const motivo = matchTitulo ? matchTitulo[1].trim() : "Página HTML de bloqueo";
-                throw new Error(`Renfe bloqueó la petición (${motivo})`);
+                const motivo = matchTitulo ? matchTitulo[1].trim() : "Bloqueo temporal de Renfe";
+                throw new Error(`Renfe no disponible (${motivo})`);
             }
 
             return JSON.parse(limpio);
         } catch (e) {
-            ultimoError = e.message || String(e);
+            if (e.name === "AbortError") {
+                ultimoError = "Tiempo de espera agotado (servidor de Renfe lento)";
+            } else {
+                ultimoError = e.message || String(e);
+            }
         } finally {
             clearTimeout(timeout);
         }
@@ -182,7 +189,7 @@ async function descargarJsonRenfe(urlRenfe) {
 }
 
 // =====================================================
-// 4. EXTRACCIÓN DE POSICIONES Y RETRASOS (LÓGICA C#)
+// 4. EXTRACCIÓN DE POSICIONES Y RETRASOS
 // =====================================================
 
 function extraerPosiciones(feedJson) {
@@ -254,7 +261,7 @@ function extraerRetrasos(feedJson) {
 }
 
 // =====================================================
-// 5. PINTADO DE MARCADORES EN EL MAPA (IDÉNTICO A C#)
+// 5. PINTADO DE MARCADORES EN EL MAPA
 // =====================================================
 
 function crearIconoTren(color) {
@@ -323,7 +330,7 @@ function eliminarAusentes(idsVigentesSet) {
 }
 
 // =====================================================
-// 6. BUCLE PRINCIPAL DE ACTUALIZACIÓN (CADA 20 S)
+// 6. BUCLE PRINCIPAL DE ACTUALIZACIÓN
 // =====================================================
 
 async function actualizarTrenesReales() {
@@ -331,11 +338,21 @@ async function actualizarTrenesReales() {
     actualizando = true;
 
     try {
-        const [resRet, resRetLD, resPos, resPosLD] = await Promise.allSettled([
-            descargarJsonRenfe(URL_RETRASOS),
-            descargarJsonRenfe(URL_RETRASOS_LD),
+        // Primero descargamos las posiciones (rápido) para pintar los trenes enseguida
+        const [resPos, resPosLD] = await Promise.allSettled([
             descargarJsonRenfe(URL_POSICIONES),
             descargarJsonRenfe(URL_POSICIONES_LD)
+        ]);
+
+        if (resPos.status !== "fulfilled" && resPosLD.status !== "fulfilled") {
+            const motivo = resPos.reason?.message || resPosLD.reason?.message || "Sin respuesta";
+            throw new Error(motivo);
+        }
+
+        // Los retrasos se piden en paralelo sin bloquear si trip_updates.json tarda mucho
+        const [resRet, resRetLD] = await Promise.allSettled([
+            descargarJsonRenfe(URL_RETRASOS),
+            descargarJsonRenfe(URL_RETRASOS_LD)
         ]);
 
         const retrasosPorViaje = new Map();
@@ -349,11 +366,6 @@ async function actualizarTrenesReales() {
             for (const [k, v] of extraerRetrasos(resRetLD.value)) {
                 retrasosPorViaje.set(k, v);
             }
-        }
-
-        if (resPos.status !== "fulfilled" && resPosLD.status !== "fulfilled") {
-            const motivo = resPos.reason?.message || resPosLD.reason?.message || "Sin respuesta";
-            throw new Error(motivo);
         }
 
         const todos = [];
@@ -412,15 +424,24 @@ async function actualizarTrenesReales() {
         eliminarAusentes(idsVigentes);
 
         const horaActual = formatearHoraActual();
+        const avisoRetrasos = (resRet.status !== "fulfilled" && resRetLD.status !== "fulfilled")
+            ? " (sin retrasos)" : "";
+
         document.title = `Radar Trenes Asturias - ${idsVigentes.size} trenes - ${horaActual}`;
         mostrarEstado(
             `Trenes: ${idsVigentes.size} | Posiciones: ${posicionesDistintas.size} | ` +
-            `Antiguas: ${trenesAntiguos} | Actualizado: ${horaActual}`
+            `Antiguas: ${trenesAntiguos}${avisoRetrasos} | Actualizado: ${horaActual}`
         );
     } catch (err) {
         console.error("Error actualizando radar:", err);
-        document.title = "Radar Trenes Asturias - Error de conexión";
-        mostrarEstado("Error de conexión: " + err.message);
+        const hayTrenesEnMapa = Object.keys(marcadoresTrenes).length > 0;
+        if (hayTrenesEnMapa) {
+            // Si ya había trenes pintados, los mantenemos visibles en lugar de borrarlos
+            mostrarEstado(`Aviso (${formatearHoraActual()}): ${err.message} — Reintentando...`);
+        } else {
+            document.title = "Radar Trenes Asturias - Error de conexión";
+            mostrarEstado("Error de conexión: " + err.message);
+        }
     } finally {
         actualizando = false;
     }
