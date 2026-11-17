@@ -75,11 +75,9 @@ const LAT_MAX = 43.85;
 const LON_MIN = -7.30;
 const LON_MAX = -4.30;
 
-// Refresco automático cada 20 segundos
-const INTERVALO_MS = 20000;
-
-// Tiempo máximo de espera ampliado a 45 segundos (los JSON de Renfe pesan varios MB)
-const TIMEOUT_DESCARGA_MS = 45000;
+// Refresco cada 30 segundos (evita bloqueos por exceso de peticiones en Renfe)
+const INTERVALO_MS = 30000;
+const TIMEOUT_DESCARGA_MS = 20000;
 
 let actualizando = false;
 const marcadoresTrenes = {};
@@ -137,16 +135,25 @@ function formatearHoraActual() {
 }
 
 // =====================================================
-// 3. DESCARGA DE DATOS (CON TIMEOUT AMPLIO Y REINTENTO)
+// 3. DESCARGA CON MÚLTIPLES RUTAS DE RESPALDO
 // =====================================================
 
-async function descargarJsonRenfe(urlRenfe) {
+function construirRutas(urlRenfe) {
     const baseWorker = WORKER_URL.replace(/\/+$/, "");
-    const destino = `${baseWorker}/?url=${encodeURIComponent(urlRenfe)}`;
+    const encoded = encodeURIComponent(urlRenfe);
+    return [
+        `${baseWorker}/?url=${encoded}`,
+        `https://api.allorigins.win/raw?url=${encoded}`,
+        `https://api.codetabs.com/v1/proxy?quest=${encoded}`,
+        urlRenfe
+    ];
+}
 
+async function descargarJsonRenfe(urlRenfe) {
+    const rutas = construirRutas(urlRenfe);
     let ultimoError = "Sin respuesta";
 
-    for (let intento = 1; intento <= 2; intento++) {
+    for (const destino of rutas) {
         const controlador = new AbortController();
         const timeout = setTimeout(() => controlador.abort(), TIMEOUT_DESCARGA_MS);
 
@@ -164,19 +171,19 @@ async function descargarJsonRenfe(urlRenfe) {
             const limpio = texto.trim();
 
             if (!limpio) {
-                throw new Error("Respuesta vacía de Renfe");
+                throw new Error("Respuesta vacía");
             }
 
             if (limpio.startsWith("<")) {
                 const matchTitulo = limpio.match(/<title[^>]*>([^<]+)<\/title>/i);
-                const motivo = matchTitulo ? matchTitulo[1].trim() : "Bloqueo temporal de Renfe";
-                throw new Error(`Renfe no disponible (${motivo})`);
+                const motivo = matchTitulo ? matchTitulo[1].trim() : "HTML inesperado";
+                throw new Error(`Bloqueo/HTML (${motivo})`);
             }
 
             return JSON.parse(limpio);
         } catch (e) {
             if (e.name === "AbortError") {
-                ultimoError = "Tiempo de espera agotado (servidor de Renfe lento)";
+                ultimoError = "Tiempo agotado esperando a Renfe";
             } else {
                 ultimoError = e.message || String(e);
             }
@@ -338,7 +345,6 @@ async function actualizarTrenesReales() {
     actualizando = true;
 
     try {
-        // Primero descargamos las posiciones (rápido) para pintar los trenes enseguida
         const [resPos, resPosLD] = await Promise.allSettled([
             descargarJsonRenfe(URL_POSICIONES),
             descargarJsonRenfe(URL_POSICIONES_LD)
@@ -349,7 +355,6 @@ async function actualizarTrenesReales() {
             throw new Error(motivo);
         }
 
-        // Los retrasos se piden en paralelo sin bloquear si trip_updates.json tarda mucho
         const [resRet, resRetLD] = await Promise.allSettled([
             descargarJsonRenfe(URL_RETRASOS),
             descargarJsonRenfe(URL_RETRASOS_LD)
@@ -436,7 +441,6 @@ async function actualizarTrenesReales() {
         console.error("Error actualizando radar:", err);
         const hayTrenesEnMapa = Object.keys(marcadoresTrenes).length > 0;
         if (hayTrenesEnMapa) {
-            // Si ya había trenes pintados, los mantenemos visibles en lugar de borrarlos
             mostrarEstado(`Aviso (${formatearHoraActual()}): ${err.message} — Reintentando...`);
         } else {
             document.title = "Radar Trenes Asturias - Error de conexión";
