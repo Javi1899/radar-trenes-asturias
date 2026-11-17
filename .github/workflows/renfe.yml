@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: renfe-datos
@@ -15,7 +16,7 @@ concurrency:
 jobs:
   actualizar:
     runs-on: ubuntu-latest
-    timeout-minutes: 7
+    timeout-minutes: 32
     steps:
       - uses: actions/checkout@v4
 
@@ -23,7 +24,8 @@ jobs:
         with:
           node-version: 20
 
-      # Cada ejecución (cron de 5 min) descarga y publica 5 veces, una por minuto.
+      # Cada ejecución descarga y publica 25 veces (una por minuto, ~25 min) y al terminar
+      # se relanza a sí misma, así no depende de la puntualidad del cron de GitHub.
       # Los datos se publican en la rama "datos" (un solo commit que se sobrescribe),
       # así no se llena el historial ni se reconstruye Pages cada minuto.
       - name: Descargar y publicar cada minuto
@@ -31,7 +33,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          for i in 1 2 3 4 5; do
+          for i in $(seq 1 25); do
             inicio=$(date +%s)
             if node scripts/fetch-renfe.js; then
               rm -rf /tmp/datos && mkdir -p /tmp/datos/data
@@ -48,7 +50,14 @@ jobs:
             else
               echo "Descarga fallida, se reintenta en el siguiente ciclo"
             fi
-            [ "$i" -lt 5 ] || break
+            [ "$i" -lt 25 ] || break
             resto=$(( 60 - ($(date +%s) - inicio) ))
             [ "$resto" -gt 0 ] && sleep "$resto"
           done
+
+      - name: Relanzar el siguiente ciclo
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X POST "repos/${{ github.repository }}/actions/workflows/renfe.yml/dispatches" -f ref="${{ github.ref_name }}" || echo "No se pudo relanzar; lo hará el cron"
