@@ -60,18 +60,13 @@
 // CONFIGURACIÓN Y CONSTANTES
 // =====================================================
 
+// ⚠️ IMPORTANTE: Sustituye esta URL por la de tu Cloudflare Worker:
+const WORKER_URL = "https://renfe-proxy.TU-USUARIO.workers.dev";
+
 const URL_POSICIONES    = "https://gtfsrt.renfe.com/vehicle_positions.pb";
 const URL_RETRASOS      = "https://gtfsrt.renfe.com/trip_updates.pb";
 const URL_POSICIONES_LD = "https://gtfsrt.renfe.com/vehicle_positions_LD.pb";
 const URL_RETRASOS_LD   = "https://gtfsrt.renfe.com/trip_updates_LD.pb";
-
-// Lista de intentos: primero directo y luego proxies CORS de respaldo
-const RUTAS_DESCARGA = [
-    (url) => url,
-    (url) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(url),
-    (url) => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(url),
-    (url) => "https://corsproxy.io/?" + encodeURIComponent(url)
-];
 
 // Límites geográficos aproximados de Asturias
 const LAT_MIN = 42.70;
@@ -415,44 +410,41 @@ function leerTripUpdate(tu, resultado) {
 }
 
 // =====================================================
-// DESCARGA CON RESPALDO AUTOMÁTICO DE PROXIES
+// DESCARGA BINARIA A TRAVÉS DEL WORKER DE CLOUDFLARE
 // =====================================================
 
 async function descargarBinario(url) {
-    let ultimoError = null;
-
-    for (const construirRuta of RUTAS_DESCARGA) {
-        const destino = construirRuta(url);
-        const controlador = new AbortController();
-        const timeout = setTimeout(() => controlador.abort(), 12000);
-
-        try {
-            const respuesta = await fetch(destino, {
-                signal: controlador.signal,
-                cache: "no-store"
-            });
-
-            if (!respuesta.ok) {
-                throw new Error(`HTTP ${respuesta.status}`);
-            }
-
-            const buffer = await respuesta.arrayBuffer();
-            const bytes = new Uint8Array(buffer);
-
-            // Verificar que no sea una página HTML de error del proxy
-            if (bytes.length > 0 && bytes[0] === 0x3C) {
-                throw new Error("El proxy devolvió HTML en lugar de datos binarios.");
-            }
-
-            return bytes;
-        } catch (err) {
-            ultimoError = err;
-        } finally {
-            clearTimeout(timeout);
-        }
+    if (WORKER_URL.includes("TU-USUARIO")) {
+        throw new Error("Falta configurar WORKER_URL en index.html");
     }
 
-    throw ultimoError || new Error("No se pudo conectar con Renfe.");
+    const base = WORKER_URL.replace(/\/+$/, "");
+    const destino = `${base}/?url=${encodeURIComponent(url)}`;
+
+    const controlador = new AbortController();
+    const timeout = setTimeout(() => controlador.abort(), 15000);
+
+    try {
+        const respuesta = await fetch(destino, {
+            signal: controlador.signal,
+            cache: "no-store"
+        });
+
+        if (!respuesta.ok) {
+            throw new Error(`HTTP ${respuesta.status}`);
+        }
+
+        const buffer = await respuesta.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+
+        if (bytes.length > 0 && bytes[0] === 0x3C) {
+            throw new Error("Respuesta HTML inesperada desde el Worker.");
+        }
+
+        return bytes;
+    } finally {
+        clearTimeout(timeout);
+    }
 }
 
 // =====================================================
@@ -556,7 +548,8 @@ async function actualizarTrenesReales() {
         }
 
         if (resPos.status !== "fulfilled" && resPosLD.status !== "fulfilled") {
-            throw new Error("No se pudieron descargar las posiciones de Renfe.");
+            const motivo = resPos.reason?.message || resPosLD.reason?.message || "Sin respuesta";
+            throw new Error(motivo);
         }
 
         const todos = [];
