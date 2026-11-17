@@ -77,11 +77,40 @@
             line-height: 1.15;
             font-variant-numeric: tabular-nums;
         }
+
+        #titulo {
+            position: fixed;
+            top: 12px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1000;
+            height: 52px;
+            box-sizing: border-box;
+            display: flex;
+            align-items: center;
+            padding: 0 22px;
+            background: rgba(0, 12, 0, 0.88);
+            border: 1px solid #00ff41;
+            border-radius: 4px;
+            box-shadow: 0 0 10px rgba(0, 255, 65, 0.6), inset 0 0 8px rgba(0, 255, 65, 0.15);
+            color: #00ff41;
+            font-family: "Courier New", Consolas, monospace;
+            font-size: 20px;
+            font-weight: bold;
+            letter-spacing: 4px;
+            white-space: nowrap;
+            text-shadow: 0 0 8px #00ff41, 0 0 16px rgba(0, 255, 65, 0.5);
+            pointer-events: none;
+        }
+        @media (max-width: 800px) {
+            #titulo { top: 78px; font-size: 13px; letter-spacing: 2px; height: 36px; padding: 0 12px; }
+        }
     </style>
 </head>
 <body>
 
 <div id="map"></div>
+<div id="titulo">RADAR DE TRENES EN ASTURIAS</div>
 <div id="cuentaatras"><div class="rotulo">SE ACTUALIZA EN:</div><div class="digitos" id="cuentaDigitos">00:00</div></div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -95,7 +124,8 @@
 // (si está en usuario.github.io/repositorio se detecta solo).
 let GITHUB_USER = "javi1899";
 let GITHUB_REPO = "radar-trenes-asturias";
-const RAMA = "main";
+// Rama donde el workflow publica los datos (se sobrescribe cada minuto, sin historial)
+const RAMA = "datos";
 
 if (!GITHUB_USER && location.hostname.endsWith(".github.io")) {
     GITHUB_USER = location.hostname.split(".")[0];
