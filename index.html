@@ -65,9 +65,13 @@ const URL_RETRASOS      = "https://gtfsrt.renfe.com/trip_updates.pb";
 const URL_POSICIONES_LD = "https://gtfsrt.renfe.com/vehicle_positions_LD.pb";
 const URL_RETRASOS_LD   = "https://gtfsrt.renfe.com/trip_updates_LD.pb";
 
-// Proxy CORS de respaldo (necesario en navegadores si Renfe bloquea peticiones directas)
-const USAR_PROXY_CORS = true;
-const PROXY_URL = "https://corsproxy.io/?";
+// Lista de intentos: primero directo y luego proxies CORS de respaldo
+const RUTAS_DESCARGA = [
+    (url) => url,
+    (url) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(url),
+    (url) => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(url),
+    (url) => "https://corsproxy.io/?" + encodeURIComponent(url)
+];
 
 // Límites geográficos aproximados de Asturias
 const LAT_MIN = 42.70;
@@ -205,7 +209,7 @@ class LectorProtobuf {
         if (this.pos + 4 > this.fin) {
             throw new Error("Datos protobuf truncados.");
         }
-        const val = this.view.getFloat32(this.pos, true); // Little-endian igual que BitConverter
+        const val = this.view.getFloat32(this.pos, true);
         this.pos += 4;
         return val;
     }
@@ -287,7 +291,6 @@ function leerVehiculo(v, t) {
 
     while ((tag = v.siguiente()) !== null) {
         if (tag.campo === 1 && tag.tipo === 2) {
-            // TripDescriptor
             const trip = v.sub();
             let t2;
             while ((t2 = trip.siguiente()) !== null) {
@@ -300,7 +303,6 @@ function leerVehiculo(v, t) {
                 }
             }
         } else if (tag.campo === 2 && tag.tipo === 2) {
-            // Position
             const pos = v.sub();
             let hayLat = false;
             let hayLon = false;
@@ -318,10 +320,8 @@ function leerVehiculo(v, t) {
             }
             tienePosicion = hayLat && hayLon;
         } else if (tag.campo === 5 && tag.tipo === 0) {
-            // Timestamp
             t.timestamp = Number(v.varint());
         } else if (tag.campo === 8 && tag.tipo === 2) {
-            // VehicleDescriptor
             const desc = v.sub();
             let t2;
             while ((t2 = desc.siguiente()) !== null) {
@@ -381,7 +381,6 @@ function leerTripUpdate(tu, resultado) {
                 }
             }
         } else if (tag.campo === 5 && tag.tipo === 0) {
-            // Convertir varint de 64 bits con signo a int32 (soporta adelantos negativos)
             retraso = Number(BigInt.asIntN(32, tu.varint()));
         } else if (tag.campo === 2 && tag.tipo === 2) {
             const stu = tu.sub();
@@ -416,24 +415,44 @@ function leerTripUpdate(tu, resultado) {
 }
 
 // =====================================================
-// DESCARGA DE FEEDS BINARIOS
+// DESCARGA CON RESPALDO AUTOMÁTICO DE PROXIES
 // =====================================================
 
 async function descargarBinario(url) {
-    const destino = USAR_PROXY_CORS ? (PROXY_URL + encodeURIComponent(url)) : url;
-    const controlador = new AbortController();
-    const timeout = setTimeout(() => controlador.abort(), 20000);
+    let ultimoError = null;
 
-    try {
-        const respuesta = await fetch(destino, { signal: controlador.signal });
-        if (!respuesta.ok) {
-            throw new Error(`HTTP ${respuesta.status}`);
+    for (const construirRuta of RUTAS_DESCARGA) {
+        const destino = construirRuta(url);
+        const controlador = new AbortController();
+        const timeout = setTimeout(() => controlador.abort(), 12000);
+
+        try {
+            const respuesta = await fetch(destino, {
+                signal: controlador.signal,
+                cache: "no-store"
+            });
+
+            if (!respuesta.ok) {
+                throw new Error(`HTTP ${respuesta.status}`);
+            }
+
+            const buffer = await respuesta.arrayBuffer();
+            const bytes = new Uint8Array(buffer);
+
+            // Verificar que no sea una página HTML de error del proxy
+            if (bytes.length > 0 && bytes[0] === 0x3C) {
+                throw new Error("El proxy devolvió HTML en lugar de datos binarios.");
+            }
+
+            return bytes;
+        } catch (err) {
+            ultimoError = err;
+        } finally {
+            clearTimeout(timeout);
         }
-        const buffer = await respuesta.arrayBuffer();
-        return new Uint8Array(buffer);
-    } finally {
-        clearTimeout(timeout);
     }
+
+    throw ultimoError || new Error("No se pudo conectar con Renfe.");
 }
 
 // =====================================================
@@ -516,7 +535,6 @@ async function actualizarTrenesReales() {
     actualizando = true;
 
     try {
-        // Descargar los 4 feeds en paralelo
         const [resRet, resRetLD, resPos, resPosLD] = await Promise.allSettled([
             descargarBinario(URL_RETRASOS),
             descargarBinario(URL_RETRASOS_LD),
@@ -524,7 +542,6 @@ async function actualizarTrenesReales() {
             descargarBinario(URL_POSICIONES_LD)
         ]);
 
-        // 1. Combinar retrasos
         const retrasosPorViaje = new Map();
 
         if (resRet.status === "fulfilled") {
@@ -538,7 +555,6 @@ async function actualizarTrenesReales() {
             }
         }
 
-        // 2. Combinar posiciones
         if (resPos.status !== "fulfilled" && resPosLD.status !== "fulfilled") {
             throw new Error("No se pudieron descargar las posiciones de Renfe.");
         }
@@ -561,7 +577,6 @@ async function actualizarTrenesReales() {
         let trenesAntiguos = 0;
         const ahora = Math.floor(Date.now() / 1000);
 
-        // 3. Procesar trenes dentro de Asturias
         for (const t of todos) {
             if (!Number.isFinite(t.lat) || !Number.isFinite(t.lon)) continue;
             if (t.lat < LAT_MIN || t.lat > LAT_MAX || t.lon < LON_MIN || t.lon > LON_MAX) continue;
@@ -614,7 +629,6 @@ async function actualizarTrenesReales() {
     }
 }
 
-// Arranque inmediato y repetición cada 20 segundos
 actualizarTrenesReales();
 setInterval(actualizarTrenesReales, INTERVALO_MS);
 </script>
