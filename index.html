@@ -61,13 +61,23 @@
 // 1. CONFIGURACIÓN
 // =====================================================
 
-const WORKER_URL = "https://morning-salad-4534.tuerojuncojavier2.workers.dev";
+// Proxy propio en Vercel (api/renfe.js). Si abres este HTML como archivo
+// local (doble clic), pon aquí la dirección completa, por ejemplo:
+// "https://radar-xxxx.vercel.app". Si la web está alojada en Vercel,
+// déjalo vacío.
+const API_BASE = "";
+
+// Respaldo opcional (Worker de Cloudflare). Renfe suele bloquearlo (error 522);
+// déjalo vacío si no lo usas.
+const WORKER_URL = "";
 
 // Feeds oficiales GTFS-Realtime JSON de Renfe
-const URL_POSICIONES    = "https://gtfsrt.renfe.com/vehicle_positions.json";
-const URL_RETRASOS      = "https://gtfsrt.renfe.com/trip_updates.json";
-const URL_POSICIONES_LD = "https://gtfsrt.renfe.com/vehicle_positions_LD.json";
-const URL_RETRASOS_LD   = "https://gtfsrt.renfe.com/trip_updates_LD.json";
+const FEEDS = {
+    vp:   "https://gtfsrt.renfe.com/vehicle_positions.json",
+    tu:   "https://gtfsrt.renfe.com/trip_updates.json",
+    vpld: "https://gtfsrt.renfe.com/vehicle_positions_LD.json",
+    tuld: "https://gtfsrt.renfe.com/trip_updates_LD.json"
+};
 
 // Rectángulo geográfico de Asturias
 const LAT_MIN = 42.70;
@@ -75,9 +85,9 @@ const LAT_MAX = 43.85;
 const LON_MIN = -7.30;
 const LON_MAX = -4.30;
 
-// Refresco cada 30 segundos (evita bloqueos por exceso de peticiones en Renfe)
-const INTERVALO_MS = 30000;
-const TIMEOUT_DESCARGA_MS = 20000;
+// Refresco cada 60 segundos (el proxy cachea 30 s; así no saturamos a Renfe)
+const INTERVALO_MS = 60000;
+const TIMEOUT_DESCARGA_MS = 10000;
 
 let actualizando = false;
 const marcadoresTrenes = {};
@@ -135,64 +145,77 @@ function formatearHoraActual() {
 }
 
 // =====================================================
-// 3. DESCARGA CON MÚLTIPLES RUTAS DE RESPALDO
+// 3. DESCARGA (proxy propio -> Worker opcional -> directo)
 // =====================================================
 
-function construirRutas(urlRenfe) {
-    const baseWorker = WORKER_URL.replace(/\/+$/, "");
+function construirRutas(clave) {
+    const urlRenfe = FEEDS[clave];
     const encoded = encodeURIComponent(urlRenfe);
-    return [
-        `${baseWorker}/?url=${encoded}`,
-        `https://api.allorigins.win/raw?url=${encoded}`,
-        `https://api.codetabs.com/v1/proxy?quest=${encoded}`,
-        urlRenfe
-    ];
+    const rutas = [];
+
+    // 1) Proxy propio (misma web o dirección completa en API_BASE)
+    if (API_BASE || location.protocol.startsWith("http")) {
+        rutas.push({
+            nombre: "proxy",
+            url: `${API_BASE.replace(/\/+$/, "")}/api/renfe?f=${clave}`
+        });
+    }
+
+    // 2) Worker de Cloudflare (si lo has configurado)
+    if (WORKER_URL) {
+        rutas.push({
+            nombre: "worker",
+            url: `${WORKER_URL.replace(/\/+$/, "")}/?url=${encoded}`
+        });
+    }
+
+    // 3) Directo (solo funcionará si Renfe permite CORS desde tu origen)
+    rutas.push({ nombre: "directo", url: urlRenfe });
+
+    return rutas;
 }
 
-async function descargarJsonRenfe(urlRenfe) {
-    const rutas = construirRutas(urlRenfe);
-    let ultimoError = "Sin respuesta";
+async function descargarJsonRenfe(clave) {
+    const rutas = construirRutas(clave);
+    const errores = [];
 
-    for (const destino of rutas) {
+    for (const ruta of rutas) {
         const controlador = new AbortController();
         const timeout = setTimeout(() => controlador.abort(), TIMEOUT_DESCARGA_MS);
 
         try {
-            const resp = await fetch(destino, {
+            const resp = await fetch(ruta.url, {
                 signal: controlador.signal,
                 cache: "no-store"
             });
 
+            const texto = (await resp.text()).trim();
+
             if (!resp.ok) {
-                throw new Error(`HTTP ${resp.status}`);
+                const detalle = texto && !texto.startsWith("<") ? ` - ${texto.slice(0, 80)}` : "";
+                throw new Error(`HTTP ${resp.status}${detalle}`);
             }
 
-            const texto = await resp.text();
-            const limpio = texto.trim();
-
-            if (!limpio) {
+            if (!texto) {
                 throw new Error("Respuesta vacía");
             }
 
-            if (limpio.startsWith("<")) {
-                const matchTitulo = limpio.match(/<title[^>]*>([^<]+)<\/title>/i);
+            if (texto.startsWith("<")) {
+                const matchTitulo = texto.match(/<title[^>]*>([^<]+)<\/title>/i);
                 const motivo = matchTitulo ? matchTitulo[1].trim() : "HTML inesperado";
                 throw new Error(`Bloqueo/HTML (${motivo})`);
             }
 
-            return JSON.parse(limpio);
+            return JSON.parse(texto);
         } catch (e) {
-            if (e.name === "AbortError") {
-                ultimoError = "Tiempo agotado esperando a Renfe";
-            } else {
-                ultimoError = e.message || String(e);
-            }
+            const msg = e.name === "AbortError" ? "tiempo agotado" : (e.message || String(e));
+            errores.push(`${ruta.nombre}: ${msg}`);
         } finally {
             clearTimeout(timeout);
         }
     }
 
-    throw new Error(ultimoError);
+    throw new Error(errores.join(" | "));
 }
 
 // =====================================================
@@ -346,18 +369,17 @@ async function actualizarTrenesReales() {
 
     try {
         const [resPos, resPosLD] = await Promise.allSettled([
-            descargarJsonRenfe(URL_POSICIONES),
-            descargarJsonRenfe(URL_POSICIONES_LD)
+            descargarJsonRenfe("vp"),
+            descargarJsonRenfe("vpld")
         ]);
 
         if (resPos.status !== "fulfilled" && resPosLD.status !== "fulfilled") {
-            const motivo = resPos.reason?.message || resPosLD.reason?.message || "Sin respuesta";
-            throw new Error(motivo);
+            throw new Error(resPos.reason?.message || resPosLD.reason?.message || "Sin respuesta");
         }
 
         const [resRet, resRetLD] = await Promise.allSettled([
-            descargarJsonRenfe(URL_RETRASOS),
-            descargarJsonRenfe(URL_RETRASOS_LD)
+            descargarJsonRenfe("tu"),
+            descargarJsonRenfe("tuld")
         ]);
 
         const retrasosPorViaje = new Map();
@@ -452,7 +474,15 @@ async function actualizarTrenesReales() {
 }
 
 actualizarTrenesReales();
-setInterval(actualizarTrenesReales, INTERVALO_MS);
+setInterval(() => {
+    // No gastar peticiones si la pestaña está oculta
+    if (!document.hidden) actualizarTrenesReales();
+}, INTERVALO_MS);
+
+// Al volver a la pestaña, refrescar al momento
+document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) actualizarTrenesReales();
+});
 </script>
 
 </body>
