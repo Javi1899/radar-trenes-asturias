@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Radar Ferroviario de Asturias</title>
+
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+    <style>
+        html, body, #map {
+            height: 100%;
+            width: 100%;
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+        }
+
+        #estado {
+            background: white;
+            padding: 9px 12px;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+            font-size: 12px;
+            font-weight: bold;
+            color: #333;
+        }
+
+        .tren-icono {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            border: 2px solid white;
+            text-align: center;
+            line-height: 30px;
+            font-size: 17px;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+        }
+
+        .leaflet-popup-content {
+            font-size: 12px;
+            line-height: 1.6;
+            min-width: 190px;
+        }
+
+        .leaflet-popup-content-wrapper {
+            border-radius: 7px;
+        }
+    </style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script>
+// =====================================================
+// CONFIGURACIÓN Y CONSTANTES
+// =====================================================
+
+const URL_POSICIONES    = "https://gtfsrt.renfe.com/vehicle_positions.pb";
+const URL_RETRASOS      = "https://gtfsrt.renfe.com/trip_updates.pb";
+const URL_POSICIONES_LD = "https://gtfsrt.renfe.com/vehicle_positions_LD.pb";
+const URL_RETRASOS_LD   = "https://gtfsrt.renfe.com/trip_updates_LD.pb";
+
+// Proxy CORS de respaldo (necesario en navegadores si Renfe bloquea peticiones directas)
+const USAR_PROXY_CORS = true;
+const PROXY_URL = "https://corsproxy.io/?";
+
+// Límites geográficos aproximados de Asturias
+const LAT_MIN = 42.70;
+const LAT_MAX = 43.85;
+const LON_MIN = -7.30;
+const LON_MAX = -4.30;
+
+// Actualización cada 20 segundos
+const INTERVALO_MS = 20000;
+
+let actualizando = false;
+const marcadoresTrenes = {};
+
+// =====================================================
+// INICIALIZAR MAPA LEAFLET
+// =====================================================
+
+const map = L.map('map').setView([43.36, -5.85], 9);
+
+L.tileLayer(
+    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
+    {
+        maxZoom: 19,
+        attribution: 'Tiles &copy; Esri'
+    }
+).addTo(map);
+
+const controlEstado = L.control({ position: 'bottomleft' });
+
+controlEstado.onAdd = function () {
+    const div = L.DomUtil.create('div');
+    div.id = 'estado';
+    div.innerText = 'Iniciando radar ferroviario...';
+    return div;
+};
+
+controlEstado.addTo(map);
+
+function mostrarEstado(mensaje) {
+    const elemento = document.getElementById('estado');
+    if (elemento) {
+        elemento.innerText = mensaje;
+    }
+}
+
+function escapar(texto) {
+    return String(texto == null ? '' : texto)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+function formatearFechaLocal(unixSegundos) {
+    const d = new Date(unixSegundos * 1000);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ` +
+           `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function formatearHoraActual() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+// =====================================================
+// LECTOR GTFS-REALTIME PROTOBUF (PORTADO DE C#)
+// =====================================================
+
+class LectorProtobuf {
+    constructor(uint8Array, inicio = 0, longitud = null) {
+        this.b = uint8Array;
+        this.pos = inicio;
+        this.fin = longitud === null ? uint8Array.length : inicio + longitud;
+        this.view = new DataView(uint8Array.buffer, uint8Array.byteOffset, uint8Array.byteLength);
+        this.decoder = new TextDecoder('utf-8');
+    }
+
+    siguiente() {
+        if (this.pos >= this.fin) {
+            return null;
+        }
+        const clave = this.varint();
+        const campo = Number(clave >> 3n);
+        const tipo = Number(clave & 7n);
+        return { campo, tipo };
+    }
+
+    varint() {
+        let resultado = 0n;
+        let shift = 0n;
+
+        while (true) {
+            if (this.pos >= this.fin) {
+                throw new Error("Datos protobuf truncados.");
+            }
+            const x = this.b[this.pos++];
+            resultado |= BigInt(x & 0x7F) << shift;
+
+            if ((x & 0x80) === 0) {
+                return resultado;
+            }
+            shift += 7n;
+            if (shift > 63n) {
+                throw new Error("Varint inválido.");
+            }
+        }
+    }
+
+    longitud() {
+        const len = Number(this.varint());
+        if (len < 0 || this.pos + len > this.fin) {
+            throw new Error("Longitud protobuf inválida.");
+        }
+        return len;
+    }
+
+    sub() {
+        const len = this.longitud();
+        const sublector = new LectorProtobuf(this.b, this.pos, len);
+        this.pos += len;
+        return sublector;
+    }
+
+    texto() {
+        const len = this.longitud();
+        const str = this.decoder.decode(this.b.subarray(this.pos, this.pos + len));
+        this.pos += len;
+        return str;
+    }
+
+    float32() {
+        if (this.pos + 4 > this.fin) {
+            throw new Error("Datos protobuf truncados.");
+        }
+        const val = this.view.getFloat32(this.pos, true); // Little-endian igual que BitConverter
+        this.pos += 4;
+        return val;
+    }
+
+    saltar(tipo) {
+        switch (tipo) {
+            case 0:
+                this.varint();
+                break;
+            case 1:
+                this.pos += 8;
+                break;
+            case 2:
+                this.pos += this.longitud();
+                break;
+            case 5:
+                this.pos += 4;
+                break;
+            default:
+                throw new Error("Tipo de campo protobuf no soportado: " + tipo);
+        }
+        if (this.pos > this.fin) {
+            throw new Error("Datos protobuf truncados.");
+        }
+    }
+}
+
+// =====================================================
+// PARSEO DE POSICIONES Y RETRASOS
+// =====================================================
+
+function leerPosiciones(bytes) {
+    const lista = [];
+    const r = new LectorProtobuf(bytes);
+    let tag;
+
+    while ((tag = r.siguiente()) !== null) {
+        if (tag.campo === 2 && tag.tipo === 2) {
+            const tren = leerEntidadPosicion(r.sub());
+            if (tren) lista.push(tren);
+        } else {
+            r.saltar(tag.tipo);
+        }
+    }
+    return lista;
+}
+
+function leerEntidadPosicion(e) {
+    const t = {
+        entidadId: "",
+        vehiculoId: "",
+        etiqueta: "",
+        viajeId: "",
+        rutaId: "",
+        lat: NaN,
+        lon: NaN,
+        timestamp: 0
+    };
+    let tienePosicion = false;
+    let tag;
+
+    while ((tag = e.siguiente()) !== null) {
+        if (tag.campo === 1 && tag.tipo === 2) {
+            t.entidadId = e.texto();
+        } else if (tag.campo === 4 && tag.tipo === 2) {
+            if (leerVehiculo(e.sub(), t)) {
+                tienePosicion = true;
+            }
+        } else {
+            e.saltar(tag.tipo);
+        }
+    }
+    return tienePosicion ? t : null;
+}
+
+function leerVehiculo(v, t) {
+    let tienePosicion = false;
+    let tag;
+
+    while ((tag = v.siguiente()) !== null) {
+        if (tag.campo === 1 && tag.tipo === 2) {
+            // TripDescriptor
+            const trip = v.sub();
+            let t2;
+            while ((t2 = trip.siguiente()) !== null) {
+                if (t2.campo === 1 && t2.tipo === 2) {
+                    t.viajeId = trip.texto();
+                } else if (t2.campo === 5 && t2.tipo === 2) {
+                    t.rutaId = trip.texto();
+                } else {
+                    trip.saltar(t2.tipo);
+                }
+            }
+        } else if (tag.campo === 2 && tag.tipo === 2) {
+            // Position
+            const pos = v.sub();
+            let hayLat = false;
+            let hayLon = false;
+            let t2;
+            while ((t2 = pos.siguiente()) !== null) {
+                if (t2.campo === 1 && t2.tipo === 5) {
+                    t.lat = pos.float32();
+                    hayLat = true;
+                } else if (t2.campo === 2 && t2.tipo === 5) {
+                    t.lon = pos.float32();
+                    hayLon = true;
+                } else {
+                    pos.saltar(t2.tipo);
+                }
+            }
+            tienePosicion = hayLat && hayLon;
+        } else if (tag.campo === 5 && tag.tipo === 0) {
+            // Timestamp
+            t.timestamp = Number(v.varint());
+        } else if (tag.campo === 8 && tag.tipo === 2) {
+            // VehicleDescriptor
+            const desc = v.sub();
+            let t2;
+            while ((t2 = desc.siguiente()) !== null) {
+                if (t2.campo === 1 && t2.tipo === 2) {
+                    t.vehiculoId = desc.texto();
+                } else if (t2.campo === 2 && t2.tipo === 2) {
+                    t.etiqueta = desc.texto();
+                } else {
+                    desc.saltar(t2.tipo);
+                }
+            }
+        } else {
+            v.saltar(tag.tipo);
+        }
+    }
+    return tienePosicion;
+}
+
+function leerRetrasos(bytes) {
+    const resultado = new Map();
+    const r = new LectorProtobuf(bytes);
+    let tag;
+
+    while ((tag = r.siguiente()) !== null) {
+        if (tag.campo === 2 && tag.tipo === 2) {
+            const entidad = r.sub();
+            let t2;
+            while ((t2 = entidad.siguiente()) !== null) {
+                if (t2.campo === 3 && t2.tipo === 2) {
+                    leerTripUpdate(entidad.sub(), resultado);
+                } else {
+                    entidad.saltar(t2.tipo);
+                }
+            }
+        } else {
+            r.saltar(tag.tipo);
+        }
+    }
+    return resultado;
+}
+
+function leerTripUpdate(tu, resultado) {
+    let viajeId = null;
+    let retraso = null;
+    let retrasoParada = null;
+    let tag;
+
+    while ((tag = tu.siguiente()) !== null) {
+        if (tag.campo === 1 && tag.tipo === 2) {
+            const trip = tu.sub();
+            let t2;
+            while ((t2 = trip.siguiente()) !== null) {
+                if (t2.campo === 1 && t2.tipo === 2) {
+                    viajeId = trip.texto();
+                } else {
+                    trip.saltar(t2.tipo);
+                }
+            }
+        } else if (tag.campo === 5 && tag.tipo === 0) {
+            // Convertir varint de 64 bits con signo a int32 (soporta adelantos negativos)
+            retraso = Number(BigInt.asIntN(32, tu.varint()));
+        } else if (tag.campo === 2 && tag.tipo === 2) {
+            const stu = tu.sub();
+            let t2;
+            while ((t2 = stu.siguiente()) !== null) {
+                if ((t2.campo === 2 || t2.campo === 3) && t2.tipo === 2) {
+                    const ev = stu.sub();
+                    let t3;
+                    while ((t3 = ev.siguiente()) !== null) {
+                        if (t3.campo === 1 && t3.tipo === 0) {
+                            const d = Number(BigInt.asIntN(32, ev.varint()));
+                            if (retrasoParada === null) {
+                                retrasoParada = d;
+                            }
+                        } else {
+                            ev.saltar(t3.tipo);
+                        }
+                    }
+                } else {
+                    stu.saltar(t2.tipo);
+                }
+            }
+        } else {
+            tu.saltar(tag.tipo);
+        }
+    }
+
+    const retrasoFinal = retraso !== null ? retraso : retrasoParada;
+    if (viajeId && retrasoFinal !== null) {
+        resultado.set(viajeId, retrasoFinal);
+    }
+}
+
+// =====================================================
+// DESCARGA DE FEEDS BINARIOS
+// =====================================================
+
+async function descargarBinario(url) {
+    const destino = USAR_PROXY_CORS ? (PROXY_URL + encodeURIComponent(url)) : url;
+    const controlador = new AbortController();
+    const timeout = setTimeout(() => controlador.abort(), 20000);
+
+    try {
+        const respuesta = await fetch(destino, { signal: controlador.signal });
+        if (!respuesta.ok) {
+            throw new Error(`HTTP ${respuesta.status}`);
+        }
+        const buffer = await respuesta.arrayBuffer();
+        return new Uint8Array(buffer);
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+// =====================================================
+// VISUALIZACIÓN EN MAPA
+// =====================================================
+
+function crearIconoTren(color) {
+    return L.divIcon({
+        className: '',
+        html: `<div class="tren-icono" style="background:${color}">🚆</div>`,
+        iconSize: [34, 34],
+        iconAnchor: [17, 17]
+    });
+}
+
+function actualizarTren(
+    id, lat, lon, nombre, retrasoMinutos,
+    fechaPosicion, edadSegundos, rutaId, viajeId, posicionAntigua
+) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+
+    let estadoTexto = '';
+    let color = '#1976D2';
+
+    if (posicionAntigua) {
+        estadoTexto = '⚠️ Posición antigua';
+        color = '#777777';
+    } else if (retrasoMinutos === null) {
+        estadoTexto = '⚪ Retraso no disponible';
+        color = '#1976D2';
+    } else if (retrasoMinutos > 0) {
+        estadoTexto = `🔴 Retraso: +${retrasoMinutos} min`;
+        color = retrasoMinutos > 5 ? '#E53935' : '#FB8C00';
+    } else if (retrasoMinutos < 0) {
+        estadoTexto = `🟢 Adelantado: ${Math.abs(retrasoMinutos)} min`;
+        color = '#2E9D50';
+    } else {
+        estadoTexto = '🟢 En hora';
+        color = '#2E9D50';
+    }
+
+    const edadTexto = edadSegundos !== null ? `${edadSegundos} segundos` : 'No disponible';
+
+    const contenido =
+        `<b>🚆 ${escapar(nombre)}</b><hr>` +
+        `<b>Estado:</b> ${estadoTexto}<br>` +
+        `<b>Latitud:</b> ${lat.toFixed(6)}<br>` +
+        `<b>Longitud:</b> ${lon.toFixed(6)}<br>` +
+        `<b>Antigüedad:</b> ${edadTexto}<br>` +
+        `<b>Última posición:</b> ${escapar(fechaPosicion)}<br>` +
+        `<b>Ruta:</b> ${escapar(rutaId || 'No disponible')}<br>` +
+        `<b>Viaje:</b> ${escapar(viajeId || 'No disponible')}`;
+
+    if (marcadoresTrenes[id]) {
+        marcadoresTrenes[id].setLatLng([lat, lon]);
+        marcadoresTrenes[id].setIcon(crearIconoTren(color));
+        marcadoresTrenes[id].setPopupContent(contenido);
+    } else {
+        const marker = L.marker([lat, lon], { icon: crearIconoTren(color) }).addTo(map);
+        marker.bindPopup(contenido);
+        marcadoresTrenes[id] = marker;
+    }
+}
+
+function eliminarAusentes(idsVigentesSet) {
+    for (const id in marcadoresTrenes) {
+        if (!idsVigentesSet.has(id)) {
+            map.removeLayer(marcadoresTrenes[id]);
+            delete marcadoresTrenes[id];
+        }
+    }
+}
+
+// =====================================================
+// BUCLE PRINCIPAL DE ACTUALIZACIÓN
+// =====================================================
+
+async function actualizarTrenesReales() {
+    if (actualizando) return;
+    actualizando = true;
+
+    try {
+        // Descargar los 4 feeds en paralelo
+        const [resRet, resRetLD, resPos, resPosLD] = await Promise.allSettled([
+            descargarBinario(URL_RETRASOS),
+            descargarBinario(URL_RETRASOS_LD),
+            descargarBinario(URL_POSICIONES),
+            descargarBinario(URL_POSICIONES_LD)
+        ]);
+
+        // 1. Combinar retrasos
+        const retrasosPorViaje = new Map();
+
+        if (resRet.status === "fulfilled") {
+            for (const [k, v] of leerRetrasos(resRet.value)) {
+                retrasosPorViaje.set(k, v);
+            }
+        }
+        if (resRetLD.status === "fulfilled") {
+            for (const [k, v] of leerRetrasos(resRetLD.value)) {
+                retrasosPorViaje.set(k, v);
+            }
+        }
+
+        // 2. Combinar posiciones
+        if (resPos.status !== "fulfilled" && resPosLD.status !== "fulfilled") {
+            throw new Error("No se pudieron descargar las posiciones de Renfe.");
+        }
+
+        const todos = [];
+        if (resPos.status === "fulfilled") {
+            todos.push(...leerPosiciones(resPos.value));
+        }
+        if (resPosLD.status === "fulfilled") {
+            const trenesLD = leerPosiciones(resPosLD.value);
+            for (const tld of trenesLD) {
+                if (tld.vehiculoId) tld.vehiculoId = "LD-" + tld.vehiculoId;
+                if (tld.entidadId) tld.entidadId = "LD-" + tld.entidadId;
+            }
+            todos.push(...trenesLD);
+        }
+
+        const idsVigentes = new Set();
+        const posicionesDistintas = new Set();
+        let trenesAntiguos = 0;
+        const ahora = Math.floor(Date.now() / 1000);
+
+        // 3. Procesar trenes dentro de Asturias
+        for (const t of todos) {
+            if (!Number.isFinite(t.lat) || !Number.isFinite(t.lon)) continue;
+            if (t.lat < LAT_MIN || t.lat > LAT_MAX || t.lon < LON_MIN || t.lon > LON_MAX) continue;
+
+            const id = t.vehiculoId || t.entidadId;
+            if (!id) continue;
+
+            const nombre = t.etiqueta || t.rutaId || id;
+
+            let edadSegundos = null;
+            let fechaPosicion = "No disponible";
+            let posicionAntigua = false;
+
+            if (t.timestamp > 0) {
+                edadSegundos = Math.max(0, ahora - t.timestamp);
+                fechaPosicion = formatearFechaLocal(t.timestamp);
+                posicionAntigua = edadSegundos > 120;
+                if (posicionAntigua) trenesAntiguos++;
+            }
+
+            let retrasoMinutos = null;
+            if (t.viajeId && retrasosPorViaje.has(t.viajeId)) {
+                retrasoMinutos = Math.round(retrasosPorViaje.get(t.viajeId) / 60);
+            }
+
+            posicionesDistintas.add(`${t.lat.toFixed(4)},${t.lon.toFixed(4)}`);
+            idsVigentes.add(id);
+
+            actualizarTren(
+                id, t.lat, t.lon, nombre, retrasoMinutos,
+                fechaPosicion, edadSegundos, t.rutaId, t.viajeId, posicionAntigua
+            );
+        }
+
+        eliminarAusentes(idsVigentes);
+
+        const horaActual = formatearHoraActual();
+        document.title = `Radar Trenes Asturias - ${idsVigentes.size} trenes - ${horaActual}`;
+        mostrarEstado(
+            `Trenes: ${idsVigentes.size} | Posiciones: ${posicionesDistintas.size} | ` +
+            `Antiguas: ${trenesAntiguos} | Actualizado: ${horaActual}`
+        );
+
+    } catch (err) {
+        console.error("Error actualizando radar:", err);
+        document.title = "Radar Trenes Asturias - Error de conexión";
+        mostrarEstado("Error de conexión: " + err.message);
+    } finally {
+        actualizando = false;
+    }
+}
+
+// Arranque inmediato y repetición cada 20 segundos
+actualizarTrenesReales();
+setInterval(actualizarTrenesReales, INTERVALO_MS);
+</script>
+
+</body>
+</html>
