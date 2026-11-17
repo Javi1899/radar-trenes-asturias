@@ -57,10 +57,6 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
 <script>
-// =====================================================
-// CONFIGURACIÓN Y CONSTANTES
-// =====================================================
-
 const WORKER_URL = "https://morning-salad-4534.tuerojuncojavier2.workers.dev";
 
 const URL_POSICIONES    = "https://gtfsrt.renfe.com/vehicle_positions.pb";
@@ -68,48 +64,34 @@ const URL_RETRASOS      = "https://gtfsrt.renfe.com/trip_updates.pb";
 const URL_POSICIONES_LD = "https://gtfsrt.renfe.com/vehicle_positions_LD.pb";
 const URL_RETRASOS_LD   = "https://gtfsrt.renfe.com/trip_updates_LD.pb";
 
-// Límites geográficos aproximados de Asturias
 const LAT_MIN = 42.70;
 const LAT_MAX = 43.85;
 const LON_MIN = -7.30;
 const LON_MAX = -4.30;
-
-// Actualización cada 20 segundos
 const INTERVALO_MS = 20000;
 
 let actualizando = false;
 const marcadoresTrenes = {};
 
-// =====================================================
-// INICIALIZAR MAPA LEAFLET
-// =====================================================
-
 const map = L.map('map').setView([43.36, -5.85], 9);
 
 L.tileLayer(
     'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
-    {
-        maxZoom: 19,
-        attribution: 'Tiles &copy; Esri'
-    }
+    { maxZoom: 19, attribution: 'Tiles &copy; Esri' }
 ).addTo(map);
 
 const controlEstado = L.control({ position: 'bottomleft' });
-
 controlEstado.onAdd = function () {
     const div = L.DomUtil.create('div');
     div.id = 'estado';
     div.innerText = 'Iniciando radar ferroviario...';
     return div;
 };
-
 controlEstado.addTo(map);
 
 function mostrarEstado(mensaje) {
     const elemento = document.getElementById('estado');
-    if (elemento) {
-        elemento.innerText = mensaje;
-    }
+    if (elemento) elemento.innerText = mensaje;
 }
 
 function escapar(texto) {
@@ -134,10 +116,6 @@ function formatearHoraActual() {
     return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-// =====================================================
-// LECTOR GTFS-REALTIME PROTOBUF (PORTADO DE C#)
-// =====================================================
-
 class LectorProtobuf {
     constructor(uint8Array, inicio = 0, longitud = null) {
         this.b = uint8Array;
@@ -148,41 +126,27 @@ class LectorProtobuf {
     }
 
     siguiente() {
-        if (this.pos >= this.fin) {
-            return null;
-        }
+        if (this.pos >= this.fin) return null;
         const clave = this.varint();
-        const campo = Number(clave >> 3n);
-        const tipo = Number(clave & 7n);
-        return { campo, tipo };
+        return { campo: Number(clave >> 3n), tipo: Number(clave & 7n) };
     }
 
     varint() {
         let resultado = 0n;
         let shift = 0n;
-
         while (true) {
-            if (this.pos >= this.fin) {
-                throw new Error("Datos protobuf truncados.");
-            }
+            if (this.pos >= this.fin) throw new Error("Datos protobuf truncados.");
             const x = this.b[this.pos++];
             resultado |= BigInt(x & 0x7F) << shift;
-
-            if ((x & 0x80) === 0) {
-                return resultado;
-            }
+            if ((x & 0x80) === 0) return resultado;
             shift += 7n;
-            if (shift > 63n) {
-                throw new Error("Varint inválido.");
-            }
+            if (shift > 63n) throw new Error("Varint inválido.");
         }
     }
 
     longitud() {
         const len = Number(this.varint());
-        if (len < 0 || this.pos + len > this.fin) {
-            throw new Error("Longitud protobuf inválida.");
-        }
+        if (len < 0 || this.pos + len > this.fin) throw new Error("Longitud protobuf inválida.");
         return len;
     }
 
@@ -201,9 +165,7 @@ class LectorProtobuf {
     }
 
     float32() {
-        if (this.pos + 4 > this.fin) {
-            throw new Error("Datos protobuf truncados.");
-        }
+        if (this.pos + 4 > this.fin) throw new Error("Datos protobuf truncados.");
         const val = this.view.getFloat32(this.pos, true);
         this.pos += 4;
         return val;
@@ -211,36 +173,20 @@ class LectorProtobuf {
 
     saltar(tipo) {
         switch (tipo) {
-            case 0:
-                this.varint();
-                break;
-            case 1:
-                this.pos += 8;
-                break;
-            case 2:
-                this.pos += this.longitud();
-                break;
-            case 5:
-                this.pos += 4;
-                break;
-            default:
-                throw new Error("Tipo de campo protobuf no soportado: " + tipo);
+            case 0: this.varint(); break;
+            case 1: this.pos += 8; break;
+            case 2: this.pos += this.longitud(); break;
+            case 5: this.pos += 4; break;
+            default: throw new Error("Tipo de campo protobuf no soportado: " + tipo);
         }
-        if (this.pos > this.fin) {
-            throw new Error("Datos protobuf truncados.");
-        }
+        if (this.pos > this.fin) throw new Error("Datos protobuf truncados.");
     }
 }
-
-// =====================================================
-// PARSEO DE POSICIONES Y RETRASOS
-// =====================================================
 
 function leerPosiciones(bytes) {
     const lista = [];
     const r = new LectorProtobuf(bytes);
     let tag;
-
     while ((tag = r.siguiente()) !== null) {
         if (tag.campo === 2 && tag.tipo === 2) {
             const tren = leerEntidadPosicion(r.sub());
@@ -253,29 +199,14 @@ function leerPosiciones(bytes) {
 }
 
 function leerEntidadPosicion(e) {
-    const t = {
-        entidadId: "",
-        vehiculoId: "",
-        etiqueta: "",
-        viajeId: "",
-        rutaId: "",
-        lat: NaN,
-        lon: NaN,
-        timestamp: 0
-    };
+    const t = { entidadId: "", vehiculoId: "", etiqueta: "", viajeId: "", rutaId: "", lat: NaN, lon: NaN, timestamp: 0 };
     let tienePosicion = false;
     let tag;
-
     while ((tag = e.siguiente()) !== null) {
-        if (tag.campo === 1 && tag.tipo === 2) {
-            t.entidadId = e.texto();
-        } else if (tag.campo === 4 && tag.tipo === 2) {
-            if (leerVehiculo(e.sub(), t)) {
-                tienePosicion = true;
-            }
-        } else {
-            e.saltar(tag.tipo);
-        }
+        if (tag.campo === 1 && tag.tipo === 2) t.entidadId = e.texto();
+        else if (tag.campo === 4 && tag.tipo === 2) {
+            if (leerVehiculo(e.sub(), t)) tienePosicion = true;
+        } else e.saltar(tag.tipo);
     }
     return tienePosicion ? t : null;
 }
@@ -283,35 +214,22 @@ function leerEntidadPosicion(e) {
 function leerVehiculo(v, t) {
     let tienePosicion = false;
     let tag;
-
     while ((tag = v.siguiente()) !== null) {
         if (tag.campo === 1 && tag.tipo === 2) {
             const trip = v.sub();
             let t2;
             while ((t2 = trip.siguiente()) !== null) {
-                if (t2.campo === 1 && t2.tipo === 2) {
-                    t.viajeId = trip.texto();
-                } else if (t2.campo === 5 && t2.tipo === 2) {
-                    t.rutaId = trip.texto();
-                } else {
-                    trip.saltar(t2.tipo);
-                }
+                if (t2.campo === 1 && t2.tipo === 2) t.viajeId = trip.texto();
+                else if (t2.campo === 5 && t2.tipo === 2) t.rutaId = trip.texto();
+                else trip.saltar(t2.tipo);
             }
         } else if (tag.campo === 2 && tag.tipo === 2) {
             const pos = v.sub();
-            let hayLat = false;
-            let hayLon = false;
-            let t2;
+            let hayLat = false, hayLon = false, t2;
             while ((t2 = pos.siguiente()) !== null) {
-                if (t2.campo === 1 && t2.tipo === 5) {
-                    t.lat = pos.float32();
-                    hayLat = true;
-                } else if (t2.campo === 2 && t2.tipo === 5) {
-                    t.lon = pos.float32();
-                    hayLon = true;
-                } else {
-                    pos.saltar(t2.tipo);
-                }
+                if (t2.campo === 1 && t2.tipo === 5) { t.lat = pos.float32(); hayLat = true; }
+                else if (t2.campo === 2 && t2.tipo === 5) { t.lon = pos.float32(); hayLon = true; }
+                else pos.saltar(t2.tipo);
             }
             tienePosicion = hayLat && hayLon;
         } else if (tag.campo === 5 && tag.tipo === 0) {
@@ -320,17 +238,11 @@ function leerVehiculo(v, t) {
             const desc = v.sub();
             let t2;
             while ((t2 = desc.siguiente()) !== null) {
-                if (t2.campo === 1 && t2.tipo === 2) {
-                    t.vehiculoId = desc.texto();
-                } else if (t2.campo === 2 && t2.tipo === 2) {
-                    t.etiqueta = desc.texto();
-                } else {
-                    desc.saltar(t2.tipo);
-                }
+                if (t2.campo === 1 && t2.tipo === 2) t.vehiculoId = desc.texto();
+                else if (t2.campo === 2 && t2.tipo === 2) t.etiqueta = desc.texto();
+                else desc.saltar(t2.tipo);
             }
-        } else {
-            v.saltar(tag.tipo);
-        }
+        } else v.saltar(tag.tipo);
     }
     return tienePosicion;
 }
@@ -339,41 +251,28 @@ function leerRetrasos(bytes) {
     const resultado = new Map();
     const r = new LectorProtobuf(bytes);
     let tag;
-
     while ((tag = r.siguiente()) !== null) {
         if (tag.campo === 2 && tag.tipo === 2) {
             const entidad = r.sub();
             let t2;
             while ((t2 = entidad.siguiente()) !== null) {
-                if (t2.campo === 3 && t2.tipo === 2) {
-                    leerTripUpdate(entidad.sub(), resultado);
-                } else {
-                    entidad.saltar(t2.tipo);
-                }
+                if (t2.campo === 3 && t2.tipo === 2) leerTripUpdate(entidad.sub(), resultado);
+                else entidad.saltar(t2.tipo);
             }
-        } else {
-            r.saltar(tag.tipo);
-        }
+        } else r.saltar(tag.tipo);
     }
     return resultado;
 }
 
 function leerTripUpdate(tu, resultado) {
-    let viajeId = null;
-    let retraso = null;
-    let retrasoParada = null;
-    let tag;
-
+    let viajeId = null, retraso = null, retrasoParada = null, tag;
     while ((tag = tu.siguiente()) !== null) {
         if (tag.campo === 1 && tag.tipo === 2) {
             const trip = tu.sub();
             let t2;
             while ((t2 = trip.siguiente()) !== null) {
-                if (t2.campo === 1 && t2.tipo === 2) {
-                    viajeId = trip.texto();
-                } else {
-                    trip.saltar(t2.tipo);
-                }
+                if (t2.campo === 1 && t2.tipo === 2) viajeId = trip.texto();
+                else trip.saltar(t2.tipo);
             }
         } else if (tag.campo === 5 && tag.tipo === 0) {
             retraso = Number(BigInt.asIntN(32, tu.varint()));
@@ -387,41 +286,22 @@ function leerTripUpdate(tu, resultado) {
                     while ((t3 = ev.siguiente()) !== null) {
                         if (t3.campo === 1 && t3.tipo === 0) {
                             const d = Number(BigInt.asIntN(32, ev.varint()));
-                            if (retrasoParada === null) {
-                                retrasoParada = d;
-                            }
-                        } else {
-                            ev.saltar(t3.tipo);
-                        }
+                            if (retrasoParada === null) retrasoParada = d;
+                        } else ev.saltar(t3.tipo);
                     }
-                } else {
-                    stu.saltar(t2.tipo);
-                }
+                } else stu.saltar(t2.tipo);
             }
-        } else {
-            tu.saltar(tag.tipo);
-        }
+        } else tu.saltar(tag.tipo);
     }
-
     const retrasoFinal = retraso !== null ? retraso : retrasoParada;
-    if (viajeId && retrasoFinal !== null) {
-        resultado.set(viajeId, retrasoFinal);
-    }
+    if (viajeId && retrasoFinal !== null) resultado.set(viajeId, retrasoFinal);
 }
 
-// =====================================================
-// DESCARGA BINARIA (CON DESCOMPRESIÓN GZIP SI HACE FALTA)
-// =====================================================
-
 async function descomprimirSiGzip(bytes) {
-    // Cabecera mágica GZIP: 0x1F 0x8B
-    if (bytes.length >= 2 && bytes[0] === 0x1F && bytes[1] === 0x8B) {
-        if (typeof DecompressionStream !== "undefined") {
-            const ds = new DecompressionStream("gzip");
-            const stream = new Blob([bytes]).stream().pipeThrough(ds);
-            const buffer = await new Response(stream).arrayBuffer();
-            return new Uint8Array(buffer);
-        }
+    if (bytes.length >= 2 && bytes[0] === 0x1F && bytes[1] === 0x8B && typeof DecompressionStream !== "undefined") {
+        const ds = new DecompressionStream("gzip");
+        const stream = new Blob([bytes]).stream().pipeThrough(ds);
+        return new Uint8Array(await new Response(stream).arrayBuffer());
     }
     return bytes;
 }
@@ -429,29 +309,26 @@ async function descomprimirSiGzip(bytes) {
 async function descargarBinario(url) {
     const base = WORKER_URL.replace(/\/+$/, "");
     const destino = `${base}/?url=${encodeURIComponent(url)}`;
-
     const controlador = new AbortController();
     const timeout = setTimeout(() => controlador.abort(), 15000);
 
     try {
-        const respuesta = await fetch(destino, {
-            signal: controlador.signal,
-            cache: "no-store"
-        });
+        const respuesta = await fetch(destino, { signal: controlador.signal, cache: "no-store" });
+        if (!respuesta.ok) throw new Error(`HTTP ${respuesta.status}`);
 
-        if (!respuesta.ok) {
-            throw new Error(`HTTP ${respuesta.status}`);
-        }
-
-        const buffer = await respuesta.arrayBuffer();
-        let bytes = new Uint8Array(buffer);
-
+        let bytes = new Uint8Array(await respuesta.arrayBuffer());
         bytes = await descomprimirSiGzip(bytes);
 
-        // Si el servidor devolvió texto/HTML/JSON en lugar de Protobuf
-        if (bytes.length > 0 && (bytes[0] === 0x3C || bytes[0] === 0x7B)) {
-            const vistaPrevia = new TextDecoder("utf-8").decode(bytes.subarray(0, 80));
-            throw new Error("Respuesta no binaria: " + vistaPrevia);
+        // Saltar espacios o saltos de línea iniciales para detectar respuestas HTML/JSON
+        let i = 0;
+        while (i < bytes.length && (bytes[i] === 0x20 || bytes[i] === 0x0A || bytes[i] === 0x0D || bytes[i] === 0x09)) {
+            i++;
+        }
+        if (i < bytes.length && (bytes[i] === 0x3C || bytes[i] === 0x7B)) {
+            const texto = new TextDecoder("utf-8").decode(bytes.subarray(i, Math.min(bytes.length, i + 250)));
+            const tituloMatch = texto.match(/<title[^>]*>([^<]+)<\/title>/i);
+            const resumen = tituloMatch ? tituloMatch[1].trim() : texto.replace(/\s+/g, " ").slice(0, 90);
+            throw new Error(`Renfe devolvió HTML en lugar de datos (${resumen})`);
         }
 
         return bytes;
@@ -459,10 +336,6 @@ async function descargarBinario(url) {
         clearTimeout(timeout);
     }
 }
-
-// =====================================================
-// VISUALIZACIÓN EN MAPA
-// =====================================================
 
 function crearIconoTren(color) {
     return L.divIcon({
@@ -473,10 +346,7 @@ function crearIconoTren(color) {
     });
 }
 
-function actualizarTren(
-    id, lat, lon, nombre, retrasoMinutos,
-    fechaPosicion, edadSegundos, rutaId, viajeId, posicionAntigua
-) {
+function actualizarTren(id, lat, lon, nombre, retrasoMinutos, fechaPosicion, edadSegundos, rutaId, viajeId, posicionAntigua) {
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
 
     let estadoTexto = '';
@@ -500,7 +370,6 @@ function actualizarTren(
     }
 
     const edadTexto = edadSegundos !== null ? `${edadSegundos} segundos` : 'No disponible';
-
     const contenido =
         `<b>🚆 ${escapar(nombre)}</b><hr>` +
         `<b>Estado:</b> ${estadoTexto}<br>` +
@@ -531,10 +400,6 @@ function eliminarAusentes(idsVigentesSet) {
     }
 }
 
-// =====================================================
-// BUCLE PRINCIPAL DE ACTUALIZACIÓN
-// =====================================================
-
 async function actualizarTrenesReales() {
     if (actualizando) return;
     actualizando = true;
@@ -548,16 +413,11 @@ async function actualizarTrenesReales() {
         ]);
 
         const retrasosPorViaje = new Map();
-
         if (resRet.status === "fulfilled") {
-            for (const [k, v] of leerRetrasos(resRet.value)) {
-                retrasosPorViaje.set(k, v);
-            }
+            for (const [k, v] of leerRetrasos(resRet.value)) retrasosPorViaje.set(k, v);
         }
         if (resRetLD.status === "fulfilled") {
-            for (const [k, v] of leerRetrasos(resRetLD.value)) {
-                retrasosPorViaje.set(k, v);
-            }
+            for (const [k, v] of leerRetrasos(resRetLD.value)) retrasosPorViaje.set(k, v);
         }
 
         if (resPos.status !== "fulfilled" && resPosLD.status !== "fulfilled") {
@@ -566,9 +426,7 @@ async function actualizarTrenesReales() {
         }
 
         const todos = [];
-        if (resPos.status === "fulfilled") {
-            todos.push(...leerPosiciones(resPos.value));
-        }
+        if (resPos.status === "fulfilled") todos.push(...leerPosiciones(resPos.value));
         if (resPosLD.status === "fulfilled") {
             const trenesLD = leerPosiciones(resPosLD.value);
             for (const tld of trenesLD) {
@@ -591,10 +449,7 @@ async function actualizarTrenesReales() {
             if (!id) continue;
 
             const nombre = t.etiqueta || t.rutaId || id;
-
-            let edadSegundos = null;
-            let fechaPosicion = "No disponible";
-            let posicionAntigua = false;
+            let edadSegundos = null, fechaPosicion = "No disponible", posicionAntigua = false;
 
             if (t.timestamp > 0) {
                 edadSegundos = Math.max(0, ahora - t.timestamp);
@@ -611,21 +466,14 @@ async function actualizarTrenesReales() {
             posicionesDistintas.add(`${t.lat.toFixed(4)},${t.lon.toFixed(4)}`);
             idsVigentes.add(id);
 
-            actualizarTren(
-                id, t.lat, t.lon, nombre, retrasoMinutos,
-                fechaPosicion, edadSegundos, t.rutaId, t.viajeId, posicionAntigua
-            );
+            actualizarTren(id, t.lat, t.lon, nombre, retrasoMinutos, fechaPosicion, edadSegundos, t.rutaId, t.viajeId, posicionAntigua);
         }
 
         eliminarAusentes(idsVigentes);
 
         const horaActual = formatearHoraActual();
         document.title = `Radar Trenes Asturias - ${idsVigentes.size} trenes - ${horaActual}`;
-        mostrarEstado(
-            `Trenes: ${idsVigentes.size} | Posiciones: ${posicionesDistintas.size} | ` +
-            `Antiguas: ${trenesAntiguos} | Actualizado: ${horaActual}`
-        );
-
+        mostrarEstado(`Trenes: ${idsVigentes.size} | Posiciones: ${posicionesDistintas.size} | Antiguas: ${trenesAntiguos} | Actualizado: ${horaActual}`);
     } catch (err) {
         console.error("Error actualizando radar:", err);
         document.title = "Radar Trenes Asturias - Error de conexión";
