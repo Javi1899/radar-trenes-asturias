@@ -60,8 +60,7 @@
 // CONFIGURACIÓN Y CONSTANTES
 // =====================================================
 
-// ⚠️ IMPORTANTE: Sustituye esta URL por la de tu Cloudflare Worker:
-const WORKER_URL = "https://renfe-proxy.TU-USUARIO.workers.dev";
+const WORKER_URL = "https://morning-salad-4534.tuerojuncojavier2.workers.dev";
 
 const URL_POSICIONES    = "https://gtfsrt.renfe.com/vehicle_positions.pb";
 const URL_RETRASOS      = "https://gtfsrt.renfe.com/trip_updates.pb";
@@ -414,10 +413,6 @@ function leerTripUpdate(tu, resultado) {
 // =====================================================
 
 async function descargarBinario(url) {
-    if (WORKER_URL.includes("TU-USUARIO")) {
-        throw new Error("Falta configurar WORKER_URL en index.html");
-    }
-
     const base = WORKER_URL.replace(/\/+$/, "");
     const destino = `${base}/?url=${encodeURIComponent(url)}`;
 
