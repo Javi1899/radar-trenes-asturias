@@ -25,7 +25,7 @@
             font-size: 12px;
             font-weight: bold;
             color: #333;
-            max-width: 90vw;
+            max-width: 92vw;
         }
 
         .tren-icono {
@@ -42,7 +42,7 @@
         .leaflet-popup-content {
             font-size: 12px;
             line-height: 1.6;
-            min-width: 190px;
+            min-width: 195px;
         }
 
         .leaflet-popup-content-wrapper {
@@ -57,41 +57,59 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
 <script>
+// =====================================================
+// 1. CONFIGURACIÓN (EQUIVALENTE A CONSTANTES EN C#)
+// =====================================================
+
+// Tu Cloudflare Worker configurado en https://dash.cloudflare.com
 const WORKER_URL = "https://morning-salad-4534.tuerojuncojavier2.workers.dev";
 
-const URL_POSICIONES    = "https://gtfsrt.renfe.com/vehicle_positions.pb";
-const URL_RETRASOS      = "https://gtfsrt.renfe.com/trip_updates.pb";
-const URL_POSICIONES_LD = "https://gtfsrt.renfe.com/vehicle_positions_LD.pb";
-const URL_RETRASOS_LD   = "https://gtfsrt.renfe.com/trip_updates_LD.pb";
+// Feeds oficiales GTFS-Realtime JSON de Renfe (mismos datos que los .pb, sin fallos binarios)
+const URL_POSICIONES    = "https://gtfsrt.renfe.com/vehicle_positions.json";
+const URL_RETRASOS      = "https://gtfsrt.renfe.com/trip_updates.json";
+const URL_POSICIONES_LD = "https://gtfsrt.renfe.com/vehicle_positions_LD.json";
+const URL_RETRASOS_LD   = "https://gtfsrt.renfe.com/trip_updates_LD.json";
 
+// Rectángulo geográfico de Asturias (idéntico al filtro de la app C#)
 const LAT_MIN = 42.70;
 const LAT_MAX = 43.85;
 const LON_MIN = -7.30;
 const LON_MAX = -4.30;
+
+// Refresco automático cada 20 segundos
 const INTERVALO_MS = 20000;
 
 let actualizando = false;
 const marcadoresTrenes = {};
 
+// =====================================================
+// 2. INICIALIZACIÓN DEL MAPA LEAFLET (COMO EN WEBVIEW2)
+// =====================================================
+
 const map = L.map('map').setView([43.36, -5.85], 9);
 
 L.tileLayer(
     'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
-    { maxZoom: 19, attribution: 'Tiles &copy; Esri' }
+    {
+        maxZoom: 19,
+        attribution: 'Tiles &copy; Esri'
+    }
 ).addTo(map);
 
 const controlEstado = L.control({ position: 'bottomleft' });
+
 controlEstado.onAdd = function () {
     const div = L.DomUtil.create('div');
     div.id = 'estado';
     div.innerText = 'Iniciando radar ferroviario...';
     return div;
 };
+
 controlEstado.addTo(map);
 
 function mostrarEstado(mensaje) {
-    const elemento = document.getElementById('estado');
-    if (elemento) elemento.innerText = mensaje;
+    const el = document.getElementById('estado');
+    if (el) el.innerText = mensaje;
 }
 
 function escapar(texto) {
@@ -116,226 +134,128 @@ function formatearHoraActual() {
     return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-class LectorProtobuf {
-    constructor(uint8Array, inicio = 0, longitud = null) {
-        this.b = uint8Array;
-        this.pos = inicio;
-        this.fin = longitud === null ? uint8Array.length : inicio + longitud;
-        this.view = new DataView(uint8Array.buffer, uint8Array.byteOffset, uint8Array.byteLength);
-        this.decoder = new TextDecoder('utf-8');
-    }
+// =====================================================
+// 3. DESCARGA DE DATOS (CON PUENTE CORS Y FALLBACK)
+// =====================================================
 
-    siguiente() {
-        if (this.pos >= this.fin) return null;
-        const clave = this.varint();
-        return { campo: Number(clave >> 3n), tipo: Number(clave & 7n) };
-    }
+async function descargarJsonRenfe(urlRenfe) {
+    const baseWorker = WORKER_URL.replace(/\/+$/, "");
+    const rutas = [
+        `${baseWorker}/?url=${encodeURIComponent(urlRenfe)}`,
+        urlRenfe
+    ];
 
-    varint() {
-        let resultado = 0n;
-        let shift = 0n;
-        while (true) {
-            if (this.pos >= this.fin) throw new Error("Datos protobuf truncados.");
-            const x = this.b[this.pos++];
-            resultado |= BigInt(x & 0x7F) << shift;
-            if ((x & 0x80) === 0) return resultado;
-            shift += 7n;
-            if (shift > 63n) throw new Error("Varint inválido.");
+    let ultimoError = "Sin respuesta";
+
+    for (const destino of rutas) {
+        const controlador = new AbortController();
+        const timeout = setTimeout(() => controlador.abort(), 15000);
+
+        try {
+            const resp = await fetch(destino, {
+                signal: controlador.signal,
+                cache: "no-store"
+            });
+
+            const texto = await resp.text();
+
+            if (!resp.ok) {
+                throw new Error(`HTTP ${resp.status}`);
+            }
+
+            const limpio = texto.trim();
+            if (limpio.startsWith("<")) {
+                const matchTitulo = limpio.match(/<title[^>]*>([^<]+)<\/title>/i);
+                const motivo = matchTitulo ? matchTitulo[1].trim() : "Página HTML de bloqueo";
+                throw new Error(`Renfe bloqueó la petición (${motivo})`);
+            }
+
+            return JSON.parse(limpio);
+        } catch (e) {
+            ultimoError = e.message || String(e);
+        } finally {
+            clearTimeout(timeout);
         }
     }
 
-    longitud() {
-        const len = Number(this.varint());
-        if (len < 0 || this.pos + len > this.fin) throw new Error("Longitud protobuf inválida.");
-        return len;
-    }
-
-    sub() {
-        const len = this.longitud();
-        const sublector = new LectorProtobuf(this.b, this.pos, len);
-        this.pos += len;
-        return sublector;
-    }
-
-    texto() {
-        const len = this.longitud();
-        const str = this.decoder.decode(this.b.subarray(this.pos, this.pos + len));
-        this.pos += len;
-        return str;
-    }
-
-    float32() {
-        if (this.pos + 4 > this.fin) throw new Error("Datos protobuf truncados.");
-        const val = this.view.getFloat32(this.pos, true);
-        this.pos += 4;
-        return val;
-    }
-
-    saltar(tipo) {
-        switch (tipo) {
-            case 0: this.varint(); break;
-            case 1: this.pos += 8; break;
-            case 2: this.pos += this.longitud(); break;
-            case 5: this.pos += 4; break;
-            default: throw new Error("Tipo de campo protobuf no soportado: " + tipo);
-        }
-        if (this.pos > this.fin) throw new Error("Datos protobuf truncados.");
-    }
+    throw new Error(ultimoError);
 }
 
-function leerPosiciones(bytes) {
+// =====================================================
+// 4. EXTRACCIÓN DE POSICIONES Y RETRASOS (LÓGICA C#)
+// =====================================================
+
+function extraerPosiciones(feedJson) {
     const lista = [];
-    const r = new LectorProtobuf(bytes);
-    let tag;
-    while ((tag = r.siguiente()) !== null) {
-        if (tag.campo === 2 && tag.tipo === 2) {
-            const tren = leerEntidadPosicion(r.sub());
-            if (tren) lista.push(tren);
-        } else {
-            r.saltar(tag.tipo);
-        }
+    const entidades = feedJson?.entity || [];
+
+    for (const ent of entidades) {
+        const veh = ent?.vehicle;
+        if (!veh || !veh.position) continue;
+
+        const lat = Number(veh.position.latitude);
+        const lon = Number(veh.position.longitude);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+
+        const trip = veh.trip || {};
+        const desc = veh.vehicle || {};
+
+        lista.push({
+            entidadId:  String(ent.id ?? ""),
+            vehiculoId: String(desc.id ?? ""),
+            etiqueta:   String(desc.label ?? ""),
+            viajeId:    String(trip.tripId ?? trip.trip_id ?? ""),
+            rutaId:     String(trip.routeId ?? trip.route_id ?? ""),
+            lat,
+            lon,
+            timestamp:  Number(veh.timestamp ?? 0)
+        });
     }
+
     return lista;
 }
 
-function leerEntidadPosicion(e) {
-    const t = { entidadId: "", vehiculoId: "", etiqueta: "", viajeId: "", rutaId: "", lat: NaN, lon: NaN, timestamp: 0 };
-    let tienePosicion = false;
-    let tag;
-    while ((tag = e.siguiente()) !== null) {
-        if (tag.campo === 1 && tag.tipo === 2) t.entidadId = e.texto();
-        else if (tag.campo === 4 && tag.tipo === 2) {
-            if (leerVehiculo(e.sub(), t)) tienePosicion = true;
-        } else e.saltar(tag.tipo);
-    }
-    return tienePosicion ? t : null;
-}
+function extraerRetrasos(feedJson) {
+    const mapa = new Map();
+    const entidades = feedJson?.entity || [];
 
-function leerVehiculo(v, t) {
-    let tienePosicion = false;
-    let tag;
-    while ((tag = v.siguiente()) !== null) {
-        if (tag.campo === 1 && tag.tipo === 2) {
-            const trip = v.sub();
-            let t2;
-            while ((t2 = trip.siguiente()) !== null) {
-                if (t2.campo === 1 && t2.tipo === 2) t.viajeId = trip.texto();
-                else if (t2.campo === 5 && t2.tipo === 2) t.rutaId = trip.texto();
-                else trip.saltar(t2.tipo);
+    for (const ent of entidades) {
+        const tu = ent?.tripUpdate || ent?.trip_update;
+        if (!tu) continue;
+
+        const trip = tu.trip || {};
+        const viajeId = String(trip.tripId ?? trip.trip_id ?? "");
+        if (!viajeId) continue;
+
+        let retrasoSeg = tu.delay != null ? Number(tu.delay) : null;
+
+        if (retrasoSeg === null || !Number.isFinite(retrasoSeg)) {
+            const paradas = tu.stopTimeUpdate || tu.stop_time_update || [];
+            for (const stu of paradas) {
+                const arrDelay = stu?.arrival?.delay;
+                const depDelay = stu?.departure?.delay;
+                if (arrDelay != null && Number.isFinite(Number(arrDelay))) {
+                    retrasoSeg = Number(arrDelay);
+                    break;
+                }
+                if (depDelay != null && Number.isFinite(Number(depDelay))) {
+                    retrasoSeg = Number(depDelay);
+                    break;
+                }
             }
-        } else if (tag.campo === 2 && tag.tipo === 2) {
-            const pos = v.sub();
-            let hayLat = false, hayLon = false, t2;
-            while ((t2 = pos.siguiente()) !== null) {
-                if (t2.campo === 1 && t2.tipo === 5) { t.lat = pos.float32(); hayLat = true; }
-                else if (t2.campo === 2 && t2.tipo === 5) { t.lon = pos.float32(); hayLon = true; }
-                else pos.saltar(t2.tipo);
-            }
-            tienePosicion = hayLat && hayLon;
-        } else if (tag.campo === 5 && tag.tipo === 0) {
-            t.timestamp = Number(v.varint());
-        } else if (tag.campo === 8 && tag.tipo === 2) {
-            const desc = v.sub();
-            let t2;
-            while ((t2 = desc.siguiente()) !== null) {
-                if (t2.campo === 1 && t2.tipo === 2) t.vehiculoId = desc.texto();
-                else if (t2.campo === 2 && t2.tipo === 2) t.etiqueta = desc.texto();
-                else desc.saltar(t2.tipo);
-            }
-        } else v.saltar(tag.tipo);
-    }
-    return tienePosicion;
-}
-
-function leerRetrasos(bytes) {
-    const resultado = new Map();
-    const r = new LectorProtobuf(bytes);
-    let tag;
-    while ((tag = r.siguiente()) !== null) {
-        if (tag.campo === 2 && tag.tipo === 2) {
-            const entidad = r.sub();
-            let t2;
-            while ((t2 = entidad.siguiente()) !== null) {
-                if (t2.campo === 3 && t2.tipo === 2) leerTripUpdate(entidad.sub(), resultado);
-                else entidad.saltar(t2.tipo);
-            }
-        } else r.saltar(tag.tipo);
-    }
-    return resultado;
-}
-
-function leerTripUpdate(tu, resultado) {
-    let viajeId = null, retraso = null, retrasoParada = null, tag;
-    while ((tag = tu.siguiente()) !== null) {
-        if (tag.campo === 1 && tag.tipo === 2) {
-            const trip = tu.sub();
-            let t2;
-            while ((t2 = trip.siguiente()) !== null) {
-                if (t2.campo === 1 && t2.tipo === 2) viajeId = trip.texto();
-                else trip.saltar(t2.tipo);
-            }
-        } else if (tag.campo === 5 && tag.tipo === 0) {
-            retraso = Number(BigInt.asIntN(32, tu.varint()));
-        } else if (tag.campo === 2 && tag.tipo === 2) {
-            const stu = tu.sub();
-            let t2;
-            while ((t2 = stu.siguiente()) !== null) {
-                if ((t2.campo === 2 || t2.campo === 3) && t2.tipo === 2) {
-                    const ev = stu.sub();
-                    let t3;
-                    while ((t3 = ev.siguiente()) !== null) {
-                        if (t3.campo === 1 && t3.tipo === 0) {
-                            const d = Number(BigInt.asIntN(32, ev.varint()));
-                            if (retrasoParada === null) retrasoParada = d;
-                        } else ev.saltar(t3.tipo);
-                    }
-                } else stu.saltar(t2.tipo);
-            }
-        } else tu.saltar(tag.tipo);
-    }
-    const retrasoFinal = retraso !== null ? retraso : retrasoParada;
-    if (viajeId && retrasoFinal !== null) resultado.set(viajeId, retrasoFinal);
-}
-
-async function descomprimirSiGzip(bytes) {
-    if (bytes.length >= 2 && bytes[0] === 0x1F && bytes[1] === 0x8B && typeof DecompressionStream !== "undefined") {
-        const ds = new DecompressionStream("gzip");
-        const stream = new Blob([bytes]).stream().pipeThrough(ds);
-        return new Uint8Array(await new Response(stream).arrayBuffer());
-    }
-    return bytes;
-}
-
-async function descargarBinario(url) {
-    const base = WORKER_URL.replace(/\/+$/, "");
-    const destino = `${base}/?url=${encodeURIComponent(url)}`;
-    const controlador = new AbortController();
-    const timeout = setTimeout(() => controlador.abort(), 15000);
-
-    try {
-        const respuesta = await fetch(destino, { signal: controlador.signal, cache: "no-store" });
-        if (!respuesta.ok) throw new Error(`HTTP ${respuesta.status}`);
-
-        let bytes = new Uint8Array(await respuesta.arrayBuffer());
-        bytes = await descomprimirSiGzip(bytes);
-
-        // Saltar espacios o saltos de línea iniciales para detectar respuestas HTML/JSON
-        let i = 0;
-        while (i < bytes.length && (bytes[i] === 0x20 || bytes[i] === 0x0A || bytes[i] === 0x0D || bytes[i] === 0x09)) {
-            i++;
-        }
-        if (i < bytes.length && (bytes[i] === 0x3C || bytes[i] === 0x7B)) {
-            const texto = new TextDecoder("utf-8").decode(bytes.subarray(i, Math.min(bytes.length, i + 250)));
-            const tituloMatch = texto.match(/<title[^>]*>([^<]+)<\/title>/i);
-            const resumen = tituloMatch ? tituloMatch[1].trim() : texto.replace(/\s+/g, " ").slice(0, 90);
-            throw new Error(`Renfe devolvió HTML en lugar de datos (${resumen})`);
         }
 
-        return bytes;
-    } finally {
-        clearTimeout(timeout);
+        if (retrasoSeg !== null && Number.isFinite(retrasoSeg)) {
+            mapa.set(viajeId, retrasoSeg);
+        }
     }
+
+    return mapa;
 }
+
+// =====================================================
+// 5. PINTADO DE MARCADORES EN EL MAPA (IDÉNTICO A C#)
+// =====================================================
 
 function crearIconoTren(color) {
     return L.divIcon({
@@ -346,9 +266,10 @@ function crearIconoTren(color) {
     });
 }
 
-function actualizarTren(id, lat, lon, nombre, retrasoMinutos, fechaPosicion, edadSegundos, rutaId, viajeId, posicionAntigua) {
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
-
+function actualizarTren(
+    id, lat, lon, nombre, retrasoMinutos,
+    fechaPosicion, edadSegundos, rutaId, viajeId, posicionAntigua
+) {
     let estadoTexto = '';
     let color = '#1976D2';
 
@@ -370,6 +291,7 @@ function actualizarTren(id, lat, lon, nombre, retrasoMinutos, fechaPosicion, eda
     }
 
     const edadTexto = edadSegundos !== null ? `${edadSegundos} segundos` : 'No disponible';
+
     const contenido =
         `<b>🚆 ${escapar(nombre)}</b><hr>` +
         `<b>Estado:</b> ${estadoTexto}<br>` +
@@ -400,24 +322,33 @@ function eliminarAusentes(idsVigentesSet) {
     }
 }
 
+// =====================================================
+// 6. BUCLE PRINCIPAL DE ACTUALIZACIÓN (CADA 20 S)
+// =====================================================
+
 async function actualizarTrenesReales() {
     if (actualizando) return;
     actualizando = true;
 
     try {
         const [resRet, resRetLD, resPos, resPosLD] = await Promise.allSettled([
-            descargarBinario(URL_RETRASOS),
-            descargarBinario(URL_RETRASOS_LD),
-            descargarBinario(URL_POSICIONES),
-            descargarBinario(URL_POSICIONES_LD)
+            descargarJsonRenfe(URL_RETRASOS),
+            descargarJsonRenfe(URL_RETRASOS_LD),
+            descargarJsonRenfe(URL_POSICIONES),
+            descargarJsonRenfe(URL_POSICIONES_LD)
         ]);
 
         const retrasosPorViaje = new Map();
+
         if (resRet.status === "fulfilled") {
-            for (const [k, v] of leerRetrasos(resRet.value)) retrasosPorViaje.set(k, v);
+            for (const [k, v] of extraerRetrasos(resRet.value)) {
+                retrasosPorViaje.set(k, v);
+            }
         }
         if (resRetLD.status === "fulfilled") {
-            for (const [k, v] of leerRetrasos(resRetLD.value)) retrasosPorViaje.set(k, v);
+            for (const [k, v] of extraerRetrasos(resRetLD.value)) {
+                retrasosPorViaje.set(k, v);
+            }
         }
 
         if (resPos.status !== "fulfilled" && resPosLD.status !== "fulfilled") {
@@ -426,9 +357,11 @@ async function actualizarTrenesReales() {
         }
 
         const todos = [];
-        if (resPos.status === "fulfilled") todos.push(...leerPosiciones(resPos.value));
+        if (resPos.status === "fulfilled") {
+            todos.push(...extraerPosiciones(resPos.value));
+        }
         if (resPosLD.status === "fulfilled") {
-            const trenesLD = leerPosiciones(resPosLD.value);
+            const trenesLD = extraerPosiciones(resPosLD.value);
             for (const tld of trenesLD) {
                 if (tld.vehiculoId) tld.vehiculoId = "LD-" + tld.vehiculoId;
                 if (tld.entidadId) tld.entidadId = "LD-" + tld.entidadId;
@@ -442,14 +375,18 @@ async function actualizarTrenesReales() {
         const ahora = Math.floor(Date.now() / 1000);
 
         for (const t of todos) {
-            if (!Number.isFinite(t.lat) || !Number.isFinite(t.lon)) continue;
-            if (t.lat < LAT_MIN || t.lat > LAT_MAX || t.lon < LON_MIN || t.lon > LON_MAX) continue;
+            if (t.lat < LAT_MIN || t.lat > LAT_MAX || t.lon < LON_MIN || t.lon > LON_MAX) {
+                continue;
+            }
 
             const id = t.vehiculoId || t.entidadId;
             if (!id) continue;
 
             const nombre = t.etiqueta || t.rutaId || id;
-            let edadSegundos = null, fechaPosicion = "No disponible", posicionAntigua = false;
+
+            let edadSegundos = null;
+            let fechaPosicion = "No disponible";
+            let posicionAntigua = false;
 
             if (t.timestamp > 0) {
                 edadSegundos = Math.max(0, ahora - t.timestamp);
@@ -466,14 +403,20 @@ async function actualizarTrenesReales() {
             posicionesDistintas.add(`${t.lat.toFixed(4)},${t.lon.toFixed(4)}`);
             idsVigentes.add(id);
 
-            actualizarTren(id, t.lat, t.lon, nombre, retrasoMinutos, fechaPosicion, edadSegundos, t.rutaId, t.viajeId, posicionAntigua);
+            actualizarTren(
+                id, t.lat, t.lon, nombre, retrasoMinutos,
+                fechaPosicion, edadSegundos, t.rutaId, t.viajeId, posicionAntigua
+            );
         }
 
         eliminarAusentes(idsVigentes);
 
         const horaActual = formatearHoraActual();
         document.title = `Radar Trenes Asturias - ${idsVigentes.size} trenes - ${horaActual}`;
-        mostrarEstado(`Trenes: ${idsVigentes.size} | Posiciones: ${posicionesDistintas.size} | Antiguas: ${trenesAntiguos} | Actualizado: ${horaActual}`);
+        mostrarEstado(
+            `Trenes: ${idsVigentes.size} | Posiciones: ${posicionesDistintas.size} | ` +
+            `Antiguas: ${trenesAntiguos} | Actualizado: ${horaActual}`
+        );
     } catch (err) {
         console.error("Error actualizando radar:", err);
         document.title = "Radar Trenes Asturias - Error de conexión";
