@@ -25,6 +25,7 @@
             font-size: 12px;
             font-weight: bold;
             color: #333;
+            max-width: 90vw;
         }
 
         .tren-icono {
@@ -409,8 +410,21 @@ function leerTripUpdate(tu, resultado) {
 }
 
 // =====================================================
-// DESCARGA BINARIA A TRAVÉS DEL WORKER DE CLOUDFLARE
+// DESCARGA BINARIA (CON DESCOMPRESIÓN GZIP SI HACE FALTA)
 // =====================================================
+
+async function descomprimirSiGzip(bytes) {
+    // Cabecera mágica GZIP: 0x1F 0x8B
+    if (bytes.length >= 2 && bytes[0] === 0x1F && bytes[1] === 0x8B) {
+        if (typeof DecompressionStream !== "undefined") {
+            const ds = new DecompressionStream("gzip");
+            const stream = new Blob([bytes]).stream().pipeThrough(ds);
+            const buffer = await new Response(stream).arrayBuffer();
+            return new Uint8Array(buffer);
+        }
+    }
+    return bytes;
+}
 
 async function descargarBinario(url) {
     const base = WORKER_URL.replace(/\/+$/, "");
@@ -430,10 +444,14 @@ async function descargarBinario(url) {
         }
 
         const buffer = await respuesta.arrayBuffer();
-        const bytes = new Uint8Array(buffer);
+        let bytes = new Uint8Array(buffer);
 
-        if (bytes.length > 0 && bytes[0] === 0x3C) {
-            throw new Error("Respuesta HTML inesperada desde el Worker.");
+        bytes = await descomprimirSiGzip(bytes);
+
+        // Si el servidor devolvió texto/HTML/JSON en lugar de Protobuf
+        if (bytes.length > 0 && (bytes[0] === 0x3C || bytes[0] === 0x7B)) {
+            const vistaPrevia = new TextDecoder("utf-8").decode(bytes.subarray(0, 80));
+            throw new Error("Respuesta no binaria: " + vistaPrevia);
         }
 
         return bytes;
